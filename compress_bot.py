@@ -26,6 +26,7 @@ from typing import Optional, Dict, List
 from bs4 import BeautifulSoup
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters, CallbackContext
 from dotenv import load_dotenv
 from flask import Flask, request
@@ -37,6 +38,17 @@ load_dotenv()
 # ============================================
 def esc(text) -> str:
     return html.escape(str(text), quote=False)
+
+
+def safe_edit(query, text, **kwargs):
+    """edit_message_text, but ignores Telegram's harmless 'message not modified'
+    error — which fires whenever a progress update happens to match the text
+    already on screen (e.g. a 1-item archive computing 0% twice in a row)."""
+    try:
+        query.edit_message_text(text, **kwargs)
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            raise
 
 
 # ============================================
@@ -59,9 +71,16 @@ if not GITHUB_TOKEN or not GITHUB_OWNER or not GITHUB_REPO:
 FORCE_CHANNEL = os.getenv('FORCE_CHANNEL', '@NCK_Dev')
 FORCE_CHANNEL_ID = int(os.getenv('FORCE_CHANNEL_ID', '-1002583286874'))
 
-MAX_FILE_SIZE = 70 * 1024 * 1024  # 70MB — GitHub's Contents API hard-caps at 100MB,
-                                    # and base64 encoding inflates the upload ~33%.
-GITHUB_API_LIMIT = 100 * 1024 * 1024  # 100MB (GitHub's actual ceiling, kept for reference)
+GITHUB_API_LIMIT = 100 * 1024 * 1024  # 100MB (GitHub's actual ceiling)
+# Telegram's cloud Bot API hard-caps getFile at ~20MB for any regular bot —
+# this is a platform limit, unrelated to GitHub, and can't be configured away.
+MAX_FILE_SIZE = 19 * 1024 * 1024  # 19MB, safe margin under Telegram's real 20MB cap
+# Mediafire/GDrive links are fetched by this server directly, not via Telegram,
+# so they're only bounded by GitHub's own Contents API ceiling.
+MAX_LINK_SIZE = 90 * 1024 * 1024  # 90MB, safe margin under GitHub's 100MB cap
+# Telegram's cloud Bot API also caps bot-sent documents around 50MB — this is
+# separate from (and more generous than) the 20MB receive cap above.
+TELEGRAM_SEND_LIMIT = 45 * 1024 * 1024  # 45MB, safe margin
 TEMP_DIR = os.getenv('TEMP_DIR', 'temp_downloads')
 PORT = int(os.getenv('PORT', 8080))
 
@@ -1125,7 +1144,14 @@ class ArchiveBot:
             return
         
         if file_size > MAX_FILE_SIZE:
-            msg.reply_text(f"❌ Too large ({self.format_size(file_size)}). Max: 2GB")
+            msg.reply_text(
+                f"❌ {self.format_size(file_size)} is over Telegram's {self.format_size(MAX_FILE_SIZE)} "
+                f"limit for files sent directly to a bot. This is a Telegram platform limit — it applies "
+                f"no matter what storage the bot uses.\n\n"
+                f"For a Mediafire or Google Drive link instead, files up to {self.format_size(MAX_LINK_SIZE)} "
+                f"work fine since those are fetched by the server directly.",
+                parse_mode=ParseMode.HTML
+            )
             return
         
         if 'files' not in session:
@@ -1191,7 +1217,7 @@ class ArchiveBot:
                         "⏳ This may take a moment.",
                         parse_mode=ParseMode.HTML
                     )
-                    local_path = download_from_mediafire(mediafire_match.group(1), local_dir, max_size=MAX_FILE_SIZE)
+                    local_path = download_from_mediafire(mediafire_match.group(1), local_dir, max_size=MAX_LINK_SIZE)
                 else:
                     msg.edit_text(
                         "🔗 <b>Google Drive Link Detected</b>\n\n"
@@ -1209,10 +1235,10 @@ class ArchiveBot:
             file_name = os.path.basename(local_path)
             file_size = os.path.getsize(local_path)
 
-            if file_size > MAX_FILE_SIZE:
+            if file_size > MAX_LINK_SIZE:
                 msg.edit_text(
                     f"❌ That file is {self.format_size(file_size)}, which is over the "
-                    f"{self.format_size(MAX_FILE_SIZE)} limit GitHub storage can handle."
+                    f"{self.format_size(MAX_LINK_SIZE)} limit GitHub storage can handle."
                 )
                 shutil.rmtree(local_dir, ignore_errors=True)
                 return
@@ -1376,6 +1402,16 @@ class ArchiveBot:
                 content_bytes = self.github_data.download_file_content(user_id, new_name)
                 
                 if content_bytes is not None:
+                    if len(content_bytes) > TELEGRAM_SEND_LIMIT:
+                        msg.edit_text(
+                            f"✅ Renamed to {new_disp}, but it's {self.format_size(len(content_bytes))} "
+                            f"which is over Telegram's {self.format_size(TELEGRAM_SEND_LIMIT)} send limit, "
+                            f"so I couldn't deliver it here. It's still saved under the new name.",
+                            parse_mode=ParseMode.HTML
+                        )
+                        self.clear_session(user_id)
+                        return
+                    
                     temp_path = os.path.join(TEMP_DIR, f"{user_id}_{new_name}")
                     with open(temp_path, 'wb') as f:
                         f.write(content_bytes)
@@ -1494,7 +1530,8 @@ class ArchiveBot:
                         zip_ref.extract(name, extract_dir)
                         if i % 5 == 0:
                             progress = (i / total) * 100 if total > 0 else 0
-                            query.edit_message_text(
+                            safe_edit(
+                                query,
                                 f"📦 Extracting {esc(file_name)}...\n\n{ProgressBar.circular(progress)}"
                             )
                             
@@ -1507,7 +1544,8 @@ class ArchiveBot:
                         rar_ref.extract(name, extract_dir)
                         if i % 5 == 0:
                             progress = (i / total) * 100 if total > 0 else 0
-                            query.edit_message_text(
+                            safe_edit(
+                                query,
                                 f"📦 Extracting {esc(file_name)}...\n\n{ProgressBar.circular(progress)}"
                             )
                             
@@ -1519,11 +1557,12 @@ class ArchiveBot:
                         sz_ref.extract(targets=[name], path=extract_dir)
                         if i % 2 == 0:
                             progress = (i / total) * 100 if total > 0 else 0
-                            query.edit_message_text(
+                            safe_edit(
+                                query,
                                 f"📦 Extracting {esc(file_name)}...\n\n{ProgressBar.circular(progress)}"
                             )
             
-            query.edit_message_text(f"✅ Extraction complete!\n\n{ProgressBar.circular(100)}")
+            safe_edit(query, f"✅ Extraction complete!\n\n{ProgressBar.circular(100)}")
             
             extracted = []
             for root, dirs, files in os.walk(extract_dir):
@@ -1538,13 +1577,15 @@ class ArchiveBot:
                 
                 thumb = self.github_data.get_user_field(user_id, 'thumbnail_path')
                 prefix = self.github_data.get_user_field(user_id, 'file_prefix')
+                skipped = []
                 
                 for f_path in extracted:
-                    if os.path.getsize(f_path) < MAX_FILE_SIZE:
-                        file_name_out = os.path.basename(f_path)
-                        if prefix:
-                            file_name_out = f"{prefix}{file_name_out}"
-                        
+                    file_size_out = os.path.getsize(f_path)
+                    file_name_out = os.path.basename(f_path)
+                    if prefix:
+                        file_name_out = f"{prefix}{file_name_out}"
+                    
+                    if file_size_out <= TELEGRAM_SEND_LIMIT:
                         with open(f_path, 'rb') as doc:
                             context.bot.send_document(
                                 chat_id=query.message.chat_id,
@@ -1552,6 +1593,22 @@ class ArchiveBot:
                                 filename=file_name_out,
                                 thumb=open(thumb, 'rb') if thumb and os.path.exists(thumb) else None
                             )
+                    else:
+                        skipped.append((file_name_out, file_size_out))
+                
+                if skipped:
+                    skip_text = "\n".join(
+                        f"• {esc(n)} ({self.format_size(s)})" for n, s in skipped
+                    )
+                    context.bot.send_message(
+                        chat_id=query.message.chat_id,
+                        text=(
+                            f"⚠️ {len(skipped)} file(s) were over Telegram's "
+                            f"{self.format_size(TELEGRAM_SEND_LIMIT)} send limit and couldn't be delivered:\n\n"
+                            f"{skip_text}"
+                        ),
+                        parse_mode=ParseMode.HTML
+                    )
             
             shutil.rmtree(extract_dir, ignore_errors=True)
             
@@ -1632,6 +1689,16 @@ class ArchiveBot:
             thumb = self.github_data.get_user_field(user_id, 'thumbnail_path')
             if prefix:
                 archive_name = f"{prefix}{archive_name}"
+            
+            archive_size = os.path.getsize(archive_path)
+            if archive_size > TELEGRAM_SEND_LIMIT:
+                query.edit_message_text(
+                    f"✅ Compressed to {esc(archive_name)} ({self.format_size(archive_size)}), but that's "
+                    f"over Telegram's {self.format_size(TELEGRAM_SEND_LIMIT)} send limit, so I couldn't "
+                    f"deliver it here. Try a smaller file or a different format.",
+                    parse_mode=ParseMode.HTML
+                )
+                return
             
             with open(archive_path, 'rb') as doc:
                 context.bot.send_document(
@@ -1739,6 +1806,15 @@ class ArchiveBot:
             temp_path = os.path.join(TEMP_DIR, f"{user_id}_{file_data['name']}")
             with open(temp_path, 'wb') as f:
                 f.write(content)
+            
+            if len(content) > TELEGRAM_SEND_LIMIT:
+                query.edit_message_text(
+                    f"❌ {esc(file_data['name'])} is {self.format_size(len(content))}, which is over "
+                    f"Telegram's {self.format_size(TELEGRAM_SEND_LIMIT)} send limit.",
+                    parse_mode=ParseMode.HTML
+                )
+                os.remove(temp_path)
+                return
             
             with open(temp_path, 'rb') as doc:
                 context.bot.send_document(
