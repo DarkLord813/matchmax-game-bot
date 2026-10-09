@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters,
 )
 from telegram.error import TelegramError
 
@@ -22,6 +22,7 @@ ROUND_TIMEOUT = int(os.getenv("ROUND_TIMEOUT", "60"))
 HOUSE_POOL_START = int(os.getenv("HOUSE_POOL_START", "10000"))
 HOUSE_REFILL = int(os.getenv("HOUSE_REFILL", "500"))
 TASK_REWARD_CAP = int(os.getenv("TASK_REWARD_CAP", "500"))
+BACKUP_DEBOUNCE = int(os.getenv("BACKUP_DEBOUNCE", "30"))
 FORCE_CHANNELS = [c.strip() for c in os.getenv("FORCE_CHANNELS", "").split(",") if c.strip()]
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
@@ -54,6 +55,8 @@ BADGES = {
     100:("🏆","Legend"),
 }
 
+DIRTY = threading.Event()
+
 
 # ---------------- GitHub backup ----------------
 def _gh_headers():
@@ -68,6 +71,9 @@ def _gh_file_url():
 
 def _gh_enabled():
     return bool(GITHUB_TOKEN and GITHUB_OWNER and GITHUB_REPO)
+
+def mark_dirty():
+    DIRTY.set()
 
 def gh_pull_db():
     if not _gh_enabled():
@@ -114,16 +120,23 @@ def gh_push_db():
         logging.warning(f"github push failed: {e}")
         return False
 
-def gh_backup_loop(interval=300):
+def gh_backup_loop(interval=300, debounce=BACKUP_DEBOUNCE):
     if not _gh_enabled():
         logging.info("backup loop disabled")
         return
+    state = {"last_force": time.time()}
     def loop():
         while True:
-            time.sleep(interval)
-            gh_push_db()
+            time.sleep(debounce)
+            now = time.time()
+            force_due = (now - state["last_force"]) >= interval
+            if DIRTY.is_set() or force_due:
+                ok = gh_push_db()
+                if ok:
+                    DIRTY.clear()
+                    state["last_force"] = now
     threading.Thread(target=loop, daemon=True, name="github-backup").start()
-    logging.info(f"github backup loop started ({interval}s)")
+    logging.info(f"github backup loop started (debounce {debounce}s, force {interval}s)")
 
 def start_health_server():
     port = int(os.getenv("PORT", "8080"))
@@ -247,6 +260,7 @@ def get_user(uid, name=None):
                     (uid, name or "Player", STARTING_STARS))
         con.commit()
         r = (uid, name or "Player", STARTING_STARS, 0, 0, None, 0, 0, 0)
+        mark_dirty()
     con.close(); return r
 
 def upd(uid, **fields):
@@ -255,6 +269,7 @@ def upd(uid, **fields):
     for k, v in fields.items():
         cur.execute(f"UPDATE users SET {k}=? WHERE user_id=?", (v, uid))
     con.commit(); con.close()
+    mark_dirty()
 
 def add_user(uid, stars=0, exp=0, wins=0, losses=0):
     con = db(); cur = con.cursor()
@@ -262,6 +277,7 @@ def add_user(uid, stars=0, exp=0, wins=0, losses=0):
                    wins=wins+?, losses=losses+? WHERE user_id=?""",
                 (stars, exp, wins, losses, uid))
     con.commit(); con.close()
+    mark_dirty()
 
 def house_pool():
     con = db(); cur = con.cursor()
@@ -274,12 +290,14 @@ def house_pool():
             cur.execute("UPDATE house SET pool=?,last_refill=? WHERE id=1",
                         (pool, datetime.utcnow().isoformat()))
             con.commit()
+            mark_dirty()
     con.close(); return pool
 
 def house_add(delta):
     con = db(); cur = con.cursor()
     cur.execute("UPDATE house SET pool = MAX(0, pool + ?) WHERE id=1", (delta,))
     con.commit(); con.close()
+    mark_dirty()
 
 def top_players(limit=10):
     con = db(); cur = con.cursor()
@@ -298,6 +316,7 @@ def create_task(channel, reward, title, admin_id):
                    VALUES(?,?,?,?,?)""",
                 (channel, reward, title, admin_id, datetime.utcnow().isoformat()))
     tid = cur.lastrowid; con.commit(); con.close()
+    mark_dirty()
     return tid
 
 def list_tasks(active_only=True):
@@ -317,6 +336,7 @@ def delete_task(tid):
     con = db(); cur = con.cursor()
     cur.execute("UPDATE tasks SET active=0 WHERE task_id=?", (tid,))
     con.commit(); con.close()
+    mark_dirty()
 
 def has_completed(uid, tid):
     con = db(); cur = con.cursor()
@@ -328,12 +348,14 @@ def mark_completed(uid, tid):
     cur.execute("INSERT OR IGNORE INTO task_completions(user_id,task_id,completed_at) VALUES(?,?,?)",
                 (uid, tid, datetime.utcnow().isoformat()))
     con.commit(); con.close()
+    mark_dirty()
 
 def log_admin(admin_id, action, details):
     con = db(); cur = con.cursor()
     cur.execute("INSERT INTO admin_log(admin_id,action,details,created_at) VALUES(?,?,?,?)",
                 (admin_id, action, details, datetime.utcnow().isoformat()))
     con.commit(); con.close()
+    mark_dirty()
 
 def task_stats():
     con = db(); cur = con.cursor()
@@ -380,6 +402,7 @@ def profile_card(uid, name):
 GAMES = {}
 QUEUES = {"solo": [], "duo": [], "squad": []}
 NEXT_GID = [1000]
+ADMIN_FLOW = {}
 
 def new_gid():
     NEXT_GID[0] += 1
@@ -441,6 +464,26 @@ def card_kb(gid, hand, rnd):
     if row: rows.append(row)
     return InlineKeyboardMarkup(rows)
 
+def reward_keypad_kb(current=""):
+    display = current if current else "0"
+    rows = [
+        [InlineKeyboardButton("⌫ Back", callback_data="k:back"),
+         InlineKeyboardButton(f"  {display}  ", callback_data="k:noop"),
+         InlineKeyboardButton("✅ Done", callback_data="k:done")],
+        [InlineKeyboardButton("1", callback_data="k:d:1"),
+         InlineKeyboardButton("2", callback_data="k:d:2"),
+         InlineKeyboardButton("3", callback_data="k:d:3")],
+        [InlineKeyboardButton("4", callback_data="k:d:4"),
+         InlineKeyboardButton("5", callback_data="k:d:5"),
+         InlineKeyboardButton("6", callback_data="k:d:6")],
+        [InlineKeyboardButton("7", callback_data="k:d:7"),
+         InlineKeyboardButton("8", callback_data="k:d:8"),
+         InlineKeyboardButton("9", callback_data="k:d:9")],
+        [InlineKeyboardButton("0", callback_data="k:d:0"),
+         InlineKeyboardButton("✖ Cancel", callback_data="a:panel")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
 
 CHANNEL_LABELS = ["⧉ ERROR/404", "📦 NCK DEV Source Codes", "🛠️ NCK DEV"]
 
@@ -477,7 +520,6 @@ FORCE_JOIN_TEXT = (
 async def enforce_join(target, ctx):
     if not FORCE_CHANNELS:
         return True, None
-
     if hasattr(target, "effective_user"):
         uid = target.effective_user.id
         send_to = target.message
@@ -488,11 +530,9 @@ async def enforce_join(target, ctx):
         is_callback = True
     else:
         return True, None
-
     missing = await check_force_channels(ctx, uid)
     if not missing:
         return True, None
-
     kb = force_join_kb()
     if is_callback:
         try:
@@ -501,7 +541,6 @@ async def enforce_join(target, ctx):
             await send_to.reply_text(FORCE_JOIN_TEXT, parse_mode="Markdown", reply_markup=kb)
     else:
         await send_to.reply_text(FORCE_JOIN_TEXT, parse_mode="Markdown", reply_markup=kb)
-
     return False, missing
 
 async def on_join_check(update, ctx):
@@ -757,13 +796,10 @@ async def admin_router(update, ctx):
             f"⚙️ *Admin Panel*\n\n"
             f"Active tasks: *{active}*\n"
             f"Total completions: *{completions}*\n\n"
-            f"*Commands:*\n"
-            f"`/newtask @channel <reward> <title>`\n"
-            f"`/tasks` — list all with IDs\n"
-            f"`/deltask <id>` — deactivate a task\n\n"
-            f"Rewards are capped at *{TASK_REWARD_CAP}* ⭐.",
+            f"Use the buttons below. Rewards capped at *{TASK_REWARD_CAP}* ⭐.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Create Task", callback_data="a:new")],
                 [InlineKeyboardButton("📋 Active Tasks", callback_data="a:list")],
                 [InlineKeyboardButton("⬅️ Main Menu", callback_data="m:home")]]))
 
@@ -777,70 +813,139 @@ async def admin_router(update, ctx):
         await q.edit_message_text(
             "\n".join(lines), parse_mode="Markdown", reply_markup=admin_back())
 
+    elif sub == "new":
+        ADMIN_FLOW[u.id] = {"step": "channel", "data": {}}
+        await q.edit_message_text(
+            "➕ *Create Task — Step 1 of 3*\n\n"
+            "Send me the channel username in the chat.\n\n"
+            "Example: `@NCK_Dev`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖ Cancel", callback_data="a:panel")]]))
 
-async def cmd_newtask(update, ctx):
+    elif sub == "del":
+        tid = int(parts[2])
+        delete_task(tid)
+        log_admin(u.id, "deltask", f"#{tid}")
+        await q.answer(f"✅ Task #{tid} deactivated.")
+        tasks = list_tasks(active_only=True)
+        if not tasks:
+            await q.edit_message_text("No active tasks.", reply_markup=admin_back()); return
+        lines = ["⚙️ *Active Tasks*\n"]
+        for t in tasks:
+            lines.append(f"`#{t[0]}` — {safe(t[3])} → {t[1]} ({t[2]}⭐)")
+        await q.edit_message_text(
+            "\n".join(lines), parse_mode="Markdown", reply_markup=admin_back())
+
+
+async def admin_message(update, ctx):
     u = update.effective_user
     if not is_admin(u.id):
-        await update.message.reply_text("Admins only."); return
-    args = ctx.args
-    if len(args) < 3:
+        return
+    flow = ADMIN_FLOW.get(u.id)
+    if not flow:
+        return
+    text = (update.message.text or "").strip()
+    step = flow["step"]
+
+    if step == "channel":
+        if not text.startswith("@"):
+            text = "@" + text
+        flow["data"]["channel"] = text
+        flow["step"] = "reward"
+        flow["data"]["reward_str"] = ""
         await update.message.reply_text(
-            "Usage: `/newtask @channel <reward> <title>`\n"
-            "Example: `/newtask @NCK_Dev 50 Join NCK DEV`",
-            parse_mode="Markdown"); return
-    channel = args[0]
-    if not channel.startswith("@"):
-        channel = "@" + channel
-    try:
-        reward = int(args[1])
-    except ValueError:
-        await update.message.reply_text("Reward must be a number."); return
-    if reward <= 0 or reward > TASK_REWARD_CAP:
+            f"✅ Channel: `{text}`\n\n"
+            f"➕ *Step 2 of 3*\n\n"
+            f"Tap the keypad to enter the reward (1–{TASK_REWARD_CAP}).\n"
+            f"Then tap ✅ Done.",
+            parse_mode="Markdown",
+            reply_markup=reward_keypad_kb(""))
+
+    elif step == "title":
+        flow["data"]["title"] = text[:64]
+        d = flow["data"]
+        tid = create_task(d["channel"], d["reward"], d["title"], u.id)
+        log_admin(u.id, "newtask", f"#{tid} {d['channel']} {d['reward']} {d['title']}")
+        ADMIN_FLOW.pop(u.id, None)
         await update.message.reply_text(
-            f"Reward must be between 1 and {TASK_REWARD_CAP}."); return
-    title = " ".join(args[2:])
-    tid = create_task(channel, reward, title, u.id)
-    log_admin(u.id, "newtask", f"#{tid} {channel} {reward} {title}")
-    await update.message.reply_text(
-        f"✅ Task created: `#{tid}`\n"
-        f"Channel: {channel}\nReward: *{reward}* ⭐\nTitle: {safe(title)}",
-        parse_mode="Markdown")
+            f"✅ *Task Created*\n\n"
+            f"ID: `#{tid}`\nChannel: {d['channel']}\n"
+            f"Reward: *{d['reward']}* ⭐\nTitle: {safe(d['title'])}",
+            parse_mode="Markdown",
+            reply_markup=admin_back())
 
 
-async def cmd_tasks(update, ctx):
-    u = update.effective_user
+async def keypad_router(update, ctx):
+    q = update.callback_query; await q.answer()
+    u = q.from_user
     if not is_admin(u.id):
-        await update.message.reply_text("Admins only."); return
-    tasks = list_tasks(active_only=False)
-    if not tasks:
-        await update.message.reply_text("No tasks yet."); return
-    lines = ["⚙️ *All Tasks*\n"]
-    for row in tasks:
-        tid, ch, reward, title, active = row
-        flag = "🟢" if active else "🔴"
-        lines.append(f"{flag} `#{tid}` — {safe(title)} → {ch} ({reward}⭐)")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await q.answer("Admins only.", show_alert=True); return
+    flow = ADMIN_FLOW.get(u.id)
+    if not flow or flow["step"] != "reward":
+        await q.answer("Session expired.", show_alert=True); return
 
+    data = q.data.split(":")
+    action = data[1] if len(data) > 1 else "noop"
+    cur = flow["data"].get("reward_str", "")
 
-async def cmd_deltask(update, ctx):
-    u = update.effective_user
-    if not is_admin(u.id):
-        await update.message.reply_text("Admins only."); return
-    if not ctx.args:
-        await update.message.reply_text("Usage: `/deltask <id>`", parse_mode="Markdown"); return
-    try:
-        tid = int(ctx.args[0])
-    except ValueError:
-        await update.message.reply_text("Task ID must be a number."); return
-    t = get_task(tid)
-    if not t:
-        await update.message.reply_text("No such task."); return
-    delete_task(tid)
-    log_admin(u.id, "deltask", f"#{tid}")
-    await update.message.reply_text(f"✅ Task `#{tid}` deactivated.", parse_mode="Markdown")
+    if action == "noop":
+        return
+    elif action == "d":
+        digit = data[2]
+        if len(cur) < 4:
+            cur = (cur + digit).lstrip("0") or "0"
+            flow["data"]["reward_str"] = cur
+            await q.edit_message_reply_markup(reply_markup=reward_keypad_kb(cur))
+    elif action == "back":
+        cur = cur[:-1]
+        flow["data"]["reward_str"] = cur
+        await q.edit_message_reply_markup(reply_markup=reward_keypad_kb(cur))
+    elif action == "done":
+        if not cur or cur == "0":
+            await q.answer("Enter a value first.", show_alert=True); return
+        val = int(cur)
+        if val < 1 or val > TASK_REWARD_CAP:
+            await q.answer(f"Must be 1–{TASK_REWARD_CAP}.", show_alert=True); return
+        flow["data"]["reward"] = val
+        flow["step"] = "title"
+        await q.edit_message_text(
+            f"✅ Channel: `{flow['data']['channel']}`\n"
+            f"✅ Reward: *{val}* ⭐\n\n"
+            f"➕ *Step 3 of 3*\n\n"
+            f"Send the task title as text in the chat.\n"
+            f"Example: `Join NCK DEV`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖ Cancel", callback_data="a:panel")]]))
 
 
 # ---------------- Queue & matchmaking ----------------
+async def queue_ticker(ctx, chat_id, msg_id, mode, amount, uid):
+    """Edit the searching message once per second for QUEUE_WAIT seconds."""
+    remaining = QUEUE_WAIT
+    while remaining > 0:
+        await asyncio.sleep(1)
+        remaining -= 1
+        still_queued = any(p["uid"] == uid for p in QUEUES[mode])
+        if not still_queued:
+            return
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=(f"🔍 *Searching for {mode.capitalize()}...*\n\n"
+                      f"⏱ *{remaining}s* remaining\n\n"
+                      f"Stake: " + (f"*{amount}* ⭐" if amount else "Friendly 🎈") + "\n\n"
+                      f"_If no real player joins, a bot will fill the seat._"),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Cancel", callback_data="cq:cancel")]]),
+            )
+        except TelegramError:
+            return
+
+
 async def queue_router(update, ctx):
     q = update.callback_query; await q.answer()
     u = q.from_user
@@ -866,13 +971,20 @@ async def queue_router(update, ctx):
         "uid": u.id, "name": u.first_name, "exp": e,
         "amount": amount, "joined": datetime.utcnow(),
     })
+
     await q.edit_message_text(
         f"🔍 *Searching for {mode.capitalize()}...*\n\n"
+        f"⏱ *{QUEUE_WAIT}s* remaining\n\n"
         f"Stake: " + (f"*{amount}* ⭐" if amount else "Friendly 🎈") + "\n\n"
-        f"Waiting up to *{QUEUE_WAIT}s* for real players.\n_Use /cancel to stop._",
+        f"_If no real player joins, a bot will fill the seat._",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ Cancel", callback_data="cq:cancel")]]))
+
+    asyncio.create_task(queue_ticker(
+        ctx, q.message.chat_id, q.message.message_id,
+        mode, amount, u.id))
+
     ctx.application.job_queue.run_once(
         try_match_job, QUEUE_WAIT, data={"mode": mode}, name=f"q_{mode}_{u.id}")
     await try_match(ctx, mode=mode)
@@ -1189,15 +1301,12 @@ def main():
     start_health_server()
     start_keepalive_loop(interval=600)
     init_db()
-    gh_backup_loop(interval=300)
+    gh_backup_loop(interval=300, debounce=BACKUP_DEBOUNCE)
 
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel_match))
-    app.add_handler(CommandHandler("newtask", cmd_newtask))
-    app.add_handler(CommandHandler("tasks", cmd_tasks))
-    app.add_handler(CommandHandler("deltask", cmd_deltask))
     app.add_handler(CallbackQueryHandler(on_join_check, pattern=r"^fj:check$"))
     app.add_handler(CallbackQueryHandler(menu, pattern=r"^m:"))
     app.add_handler(CallbackQueryHandler(play_router, pattern=r"^p:"))
@@ -1207,6 +1316,8 @@ def main():
     app.add_handler(CallbackQueryHandler(card_play, pattern=r"^c:"))
     app.add_handler(CallbackQueryHandler(tasks_router, pattern=r"^t:"))
     app.add_handler(CallbackQueryHandler(admin_router, pattern=r"^a:"))
+    app.add_handler(CallbackQueryHandler(keypad_router, pattern=r"^k:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_message))
 
     print("Star Cards running...")
     app.run_polling()
