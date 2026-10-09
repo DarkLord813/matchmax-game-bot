@@ -142,6 +142,23 @@ def start_health_server():
     threading.Thread(target=serve, daemon=True, name="health").start()
     logging.info(f"health server on :{port}")
 
+def start_keepalive_loop(interval=600):
+    url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("KEEPALIVE_URL", "")
+    if not url:
+        logging.info("keepalive disabled (no RENDER_EXTERNAL_URL)")
+        return
+    ping_url = url.rstrip("/") + "/"
+    def loop():
+        while True:
+            time.sleep(interval)
+            try:
+                r = requests.get(ping_url, timeout=10)
+                logging.info(f"keepalive ping {ping_url} → {r.status_code}")
+            except Exception as e:
+                logging.warning(f"keepalive ping failed: {e}")
+    threading.Thread(target=loop, daemon=True, name="keepalive").start()
+    logging.info(f"keepalive loop started ({interval}s → {ping_url})")
+
 
 # ---------------- Level math ----------------
 def exp_for_level(lv):
@@ -458,27 +475,19 @@ FORCE_JOIN_TEXT = (
 )
 
 async def enforce_join(target, ctx):
-    """
-    target can be:
-      - an Update (from /start)
-      - a CallbackQuery (from a button tap)
-    Returns (True, None) if allowed, (False, missing) if blocked.
-    """
     if not FORCE_CHANNELS:
         return True, None
 
     if hasattr(target, "effective_user"):
-        # Update object
         uid = target.effective_user.id
         send_to = target.message
         is_callback = False
     elif hasattr(target, "from_user"):
-        # CallbackQuery
         uid = target.from_user.id
         send_to = target.message
         is_callback = True
     else:
-        return True, None  # unknown → fail open
+        return True, None
 
     missing = await check_force_channels(ctx, uid)
     if not missing:
@@ -1178,6 +1187,7 @@ async def forfeit_match(ctx, gid, leaver_id, reason="left"):
 # ---------------- main ----------------
 def main():
     start_health_server()
+    start_keepalive_loop(interval=600)
     init_db()
     gh_backup_loop(interval=300)
 
