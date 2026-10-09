@@ -25,7 +25,6 @@ TASK_REWARD_CAP = int(os.getenv("TASK_REWARD_CAP", "500"))
 FORCE_CHANNELS = [c.strip() for c in os.getenv("FORCE_CHANNELS", "").split(",") if c.strip()]
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
-# GitHub backup config
 GITHUB_TOKEN  = os.getenv("GITHUB_TOKEN", "")
 GITHUB_OWNER  = os.getenv("GITHUB_OWNER", "DarkLord813")
 GITHUB_REPO   = os.getenv("GITHUB_REPO", "matchmax-backup")
@@ -56,7 +55,7 @@ BADGES = {
 }
 
 
-# ---------------- GitHub backup (inline) ----------------
+# ---------------- GitHub backup ----------------
 def _gh_headers():
     return {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -459,20 +458,41 @@ FORCE_JOIN_TEXT = (
 )
 
 async def enforce_join(target, ctx):
+    """
+    target can be:
+      - an Update (from /start)
+      - a CallbackQuery (from a button tap)
+    Returns (True, None) if allowed, (False, missing) if blocked.
+    """
     if not FORCE_CHANNELS:
         return True, None
-    uid = target.from_user.id
+
+    if hasattr(target, "effective_user"):
+        # Update object
+        uid = target.effective_user.id
+        send_to = target.message
+        is_callback = False
+    elif hasattr(target, "from_user"):
+        # CallbackQuery
+        uid = target.from_user.id
+        send_to = target.message
+        is_callback = True
+    else:
+        return True, None  # unknown → fail open
+
     missing = await check_force_channels(ctx, uid)
     if not missing:
         return True, None
+
     kb = force_join_kb()
-    if hasattr(target, "edit_message_text"):
+    if is_callback:
         try:
             await target.edit_message_text(FORCE_JOIN_TEXT, parse_mode="Markdown", reply_markup=kb)
         except TelegramError:
-            await target.message.reply_text(FORCE_JOIN_TEXT, parse_mode="Markdown", reply_markup=kb)
+            await send_to.reply_text(FORCE_JOIN_TEXT, parse_mode="Markdown", reply_markup=kb)
     else:
-        await target.message.reply_text(FORCE_JOIN_TEXT, parse_mode="Markdown", reply_markup=kb)
+        await send_to.reply_text(FORCE_JOIN_TEXT, parse_mode="Markdown", reply_markup=kb)
+
     return False, missing
 
 async def on_join_check(update, ctx):
