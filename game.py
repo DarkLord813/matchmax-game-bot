@@ -56,6 +56,7 @@ BADGES = {
 }
 
 DIRTY = threading.Event()
+_db_lock = threading.Lock()
 
 
 # ---------------- GitHub backup ----------------
@@ -219,7 +220,10 @@ def is_admin(uid): return uid in ADMIN_IDS
 
 
 # ---------------- DB ----------------
-def db(): return sqlite3.connect(DB)
+def db():
+    con = sqlite3.connect(DB, check_same_thread=False, timeout=30)
+    con.execute("PRAGMA journal_mode=WAL")
+    return con
 
 def init_db():
     gh_pull_db()
@@ -247,123 +251,149 @@ def init_db():
         created_at TEXT)""")
     con.commit()
     cur.execute("INSERT OR IGNORE INTO house(id,pool,last_refill) VALUES(1,?,?)",
-                (HOUSE_POOL_START, datetime.utcnow().isoformat()))
+                (HOUSE_POOL_START, str(int(time.time()))))
     con.commit(); con.close()
 
 def get_user(uid, name=None):
-    con = db(); cur = con.cursor()
-    cur.execute("""SELECT user_id,name,stars,exp,streak,last_gift,
-                   wins,losses,seen_tutorial FROM users WHERE user_id=?""", (uid,))
-    r = cur.fetchone()
-    if not r:
-        cur.execute("INSERT INTO users(user_id,name,stars) VALUES(?,?,?)",
-                    (uid, name or "Player", STARTING_STARS))
-        con.commit()
-        r = (uid, name or "Player", STARTING_STARS, 0, 0, None, 0, 0, 0)
-        mark_dirty()
-    con.close(); return r
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("""SELECT user_id,name,stars,exp,streak,last_gift,
+                       wins,losses,seen_tutorial FROM users WHERE user_id=?""", (uid,))
+        r = cur.fetchone()
+        if not r:
+            cur.execute("INSERT INTO users(user_id,name,stars) VALUES(?,?,?)",
+                        (uid, name or "Player", STARTING_STARS))
+            con.commit()
+            r = (uid, name or "Player", STARTING_STARS, 0, 0, None, 0, 0, 0)
+            mark_dirty()
+        con.close()
+    return r
 
 def upd(uid, **fields):
     if not fields: return
-    con = db(); cur = con.cursor()
-    for k, v in fields.items():
-        cur.execute(f"UPDATE users SET {k}=? WHERE user_id=?", (v, uid))
-    con.commit(); con.close()
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        for k, v in fields.items():
+            cur.execute(f"UPDATE users SET {k}=? WHERE user_id=?", (v, uid))
+        con.commit(); con.close()
     mark_dirty()
 
 def add_user(uid, stars=0, exp=0, wins=0, losses=0):
-    con = db(); cur = con.cursor()
-    cur.execute("""UPDATE users SET stars=stars+?, exp=exp+?,
-                   wins=wins+?, losses=losses+? WHERE user_id=?""",
-                (stars, exp, wins, losses, uid))
-    con.commit(); con.close()
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("""UPDATE users SET stars=stars+?, exp=exp+?,
+                       wins=wins+?, losses=losses+? WHERE user_id=?""",
+                    (stars, exp, wins, losses, uid))
+        con.commit(); con.close()
     mark_dirty()
 
 def house_pool():
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT pool,last_refill FROM house WHERE id=1")
-    pool, last = cur.fetchone()
-    if last:
-        last_dt = datetime.fromisoformat(last)
-        if datetime.utcnow() - last_dt >= timedelta(hours=24):
-            pool = min(pool + HOUSE_REFILL, HOUSE_POOL_START)
-            cur.execute("UPDATE house SET pool=?,last_refill=? WHERE id=1",
-                        (pool, datetime.utcnow().isoformat()))
-            con.commit()
-            mark_dirty()
-    con.close(); return pool
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("SELECT pool,last_refill FROM house WHERE id=1")
+        pool, last = cur.fetchone()
+        if last:
+            try:
+                last_ts = int(last)
+            except (ValueError, TypeError):
+                last_ts = 0
+            if time.time() - last_ts >= 86400:
+                pool = min(pool + HOUSE_REFILL, HOUSE_POOL_START)
+                cur.execute("UPDATE house SET pool=?,last_refill=? WHERE id=1",
+                            (pool, str(int(time.time()))))
+                con.commit()
+                mark_dirty()
+        con.close()
+    return pool
 
 def house_add(delta):
-    con = db(); cur = con.cursor()
-    cur.execute("UPDATE house SET pool = MAX(0, pool + ?) WHERE id=1", (delta,))
-    con.commit(); con.close()
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("UPDATE house SET pool = MAX(0, pool + ?) WHERE id=1", (delta,))
+        con.commit(); con.close()
     mark_dirty()
 
 def top_players(limit=10):
-    con = db(); cur = con.cursor()
-    cur.execute("""SELECT name,stars,exp FROM users
-                   ORDER BY exp DESC, stars DESC LIMIT ?""", (limit,))
-    r = cur.fetchall(); con.close(); return r
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("""SELECT name,stars,exp FROM users
+                       ORDER BY exp DESC, stars DESC LIMIT ?""", (limit,))
+        r = cur.fetchall(); con.close()
+    return r
 
 def total_users():
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT COUNT(*) FROM users")
-    n = cur.fetchone()[0]; con.close(); return n
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        n = cur.fetchone()[0]; con.close()
+    return n
 
 def create_task(channel, reward, title, admin_id):
-    con = db(); cur = con.cursor()
-    cur.execute("""INSERT INTO tasks(channel,reward,title,created_by,created_at)
-                   VALUES(?,?,?,?,?)""",
-                (channel, reward, title, admin_id, datetime.utcnow().isoformat()))
-    tid = cur.lastrowid; con.commit(); con.close()
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("""INSERT INTO tasks(channel,reward,title,created_by,created_at)
+                       VALUES(?,?,?,?,?)""",
+                    (channel, reward, title, admin_id, str(int(time.time()))))
+        tid = cur.lastrowid; con.commit(); con.close()
     mark_dirty()
     return tid
 
 def list_tasks(active_only=True):
-    con = db(); cur = con.cursor()
-    if active_only:
-        cur.execute("SELECT task_id,channel,reward,title FROM tasks WHERE active=1 ORDER BY task_id")
-    else:
-        cur.execute("SELECT task_id,channel,reward,title,active FROM tasks ORDER BY task_id")
-    r = cur.fetchall(); con.close(); return r
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        if active_only:
+            cur.execute("SELECT task_id,channel,reward,title FROM tasks WHERE active=1 ORDER BY task_id")
+        else:
+            cur.execute("SELECT task_id,channel,reward,title,active FROM tasks ORDER BY task_id")
+        r = cur.fetchall(); con.close()
+    return r
 
 def get_task(tid):
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT task_id,channel,reward,title,active FROM tasks WHERE task_id=?", (tid,))
-    r = cur.fetchone(); con.close(); return r
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("SELECT task_id,channel,reward,title,active FROM tasks WHERE task_id=?", (tid,))
+        r = cur.fetchone(); con.close()
+    return r
 
 def delete_task(tid):
-    con = db(); cur = con.cursor()
-    cur.execute("UPDATE tasks SET active=0 WHERE task_id=?", (tid,))
-    con.commit(); con.close()
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("UPDATE tasks SET active=0 WHERE task_id=?", (tid,))
+        con.commit(); con.close()
     mark_dirty()
 
 def has_completed(uid, tid):
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT 1 FROM task_completions WHERE user_id=? AND task_id=?", (uid, tid))
-    r = cur.fetchone(); con.close(); return r is not None
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("SELECT 1 FROM task_completions WHERE user_id=? AND task_id=?", (uid, tid))
+        r = cur.fetchone(); con.close()
+    return r is not None
 
 def mark_completed(uid, tid):
-    con = db(); cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO task_completions(user_id,task_id,completed_at) VALUES(?,?,?)",
-                (uid, tid, datetime.utcnow().isoformat()))
-    con.commit(); con.close()
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("INSERT OR IGNORE INTO task_completions(user_id,task_id,completed_at) VALUES(?,?,?)",
+                    (uid, tid, str(int(time.time()))))
+        con.commit(); con.close()
     mark_dirty()
 
 def log_admin(admin_id, action, details):
-    con = db(); cur = con.cursor()
-    cur.execute("INSERT INTO admin_log(admin_id,action,details,created_at) VALUES(?,?,?,?)",
-                (admin_id, action, details, datetime.utcnow().isoformat()))
-    con.commit(); con.close()
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("INSERT INTO admin_log(admin_id,action,details,created_at) VALUES(?,?,?,?)",
+                    (admin_id, action, details, str(int(time.time()))))
+        con.commit(); con.close()
     mark_dirty()
 
 def task_stats():
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT COUNT(*) FROM tasks WHERE active=1")
-    active = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM task_completions")
-    completions = cur.fetchone()[0]
-    con.close(); return active, completions
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("SELECT COUNT(*) FROM tasks WHERE active=1")
+        active = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM task_completions")
+        completions = cur.fetchone()[0]
+        con.close()
+    return active, completions
 
 
 def profile_card(uid, name):
@@ -646,21 +676,31 @@ async def menu(update, ctx):
             parse_mode="Markdown", reply_markup=back())
 
     elif a == "gift":
+        now_ts = int(time.time())
         if last:
-            dt = datetime.fromisoformat(last)
-            elapsed = datetime.utcnow() - dt
-            if elapsed < timedelta(hours=24):
-                wait = timedelta(hours=24) - elapsed
+            try:
+                last_ts = int(last)
+            except (ValueError, TypeError):
+                last_ts = 0
+            elapsed = now_ts - last_ts
+            if elapsed < 86400:
+                remaining = 86400 - elapsed
+                hrs = remaining // 3600
+                mins = (remaining % 3600) // 60
                 await q.edit_message_text(
-                    f"⏳ Come back in *{wait.seconds//3600}h {(wait.seconds%3600)//60}m*.",
+                    f"⏳ *Gift already claimed*\n\n"
+                    f"Come back in *{hrs}h {mins}m*.\n\n"
+                    f"🔥 Current streak: *{st} days*",
                     parse_mode="Markdown", reply_markup=back()); return
-            if elapsed > timedelta(hours=48): st = 0
+            if elapsed > 172800:
+                st = 0
         new_st = st + 1
         reward = min(CHECKIN_BASE + st * CHECKIN_PER_STREAK, CHECKIN_CAP)
         exp_r = min(5 + st, 20)
         old_lv = level_from_exp(e)
         add_user(u.id, stars=reward, exp=exp_r)
-        upd(u.id, streak=new_st, last_gift=datetime.utcnow().isoformat())
+        upd(u.id, streak=new_st, last_gift=str(now_ts))
+        threading.Thread(target=gh_push_db, daemon=True).start()
         _,_,ns,ne,_,_,_,_,_ = get_user(u.id, u.first_name)
         new_lv = level_from_exp(ne)
         txt = (f"🎁 *Daily Gift!*\n\n🔥 Streak: *{new_st} days*\n"
