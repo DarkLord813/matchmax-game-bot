@@ -922,7 +922,6 @@ async def keypad_router(update, ctx):
 
 # ---------------- Queue & matchmaking ----------------
 async def queue_ticker(ctx, chat_id, msg_id, mode, amount, uid):
-    """Edit the searching message once per second for QUEUE_WAIT seconds."""
     remaining = QUEUE_WAIT
     while remaining > 0:
         await asyncio.sleep(1)
@@ -999,7 +998,31 @@ async def cancel_queue(update, ctx):
 
 
 async def try_match_job(ctx):
-    await try_match(ctx, mode=ctx.job.data["mode"])
+    mode = ctx.job.data["mode"]
+    await try_match(ctx, mode=mode)
+    await force_fill_queue(ctx, mode)
+
+
+async def force_fill_queue(ctx, mode):
+    size = {"solo": 2, "duo": 4, "squad": 6}[mode]
+    now = datetime.utcnow()
+    while True:
+        waiting = [p for p in QUEUES[mode]
+                   if (now - p["joined"]).total_seconds() >= QUEUE_WAIT - 1]
+        if not waiting:
+            break
+        host = waiting[0]
+        host_lv = level_from_exp(host["exp"])
+        pool = [p for p in QUEUES[mode]
+                if abs(level_from_exp(p["exp"]) - host_lv) <= 3
+                and p["amount"] == host["amount"]]
+        pool = pool[:size]
+        for p in pool:
+            if p in QUEUES[mode]:
+                QUEUES[mode].remove(p)
+        while len(pool) < size:
+            pool.append(make_bot(host["amount"], host_lv))
+        await start_match(ctx, mode, pool)
 
 
 async def try_match(ctx, mode=None):
