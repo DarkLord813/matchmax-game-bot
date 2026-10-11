@@ -905,6 +905,12 @@ async def admin_message(update, ctx):
     elif step == "title":
         flow["data"]["title"] = text[:64]
         d = flow["data"]
+        if "channel" not in d or "reward" not in d:
+            ADMIN_FLOW.pop(u.id, None)
+            await update.message.reply_text(
+                "⚠️ Session expired — start over from the Admin Panel.",
+                reply_markup=admin_back())
+            return
         tid = create_task(d["channel"], d["reward"], d["title"], u.id)
         log_admin(u.id, "newtask", f"#{tid} {d['channel']} {d['reward']} {d['title']}")
         ADMIN_FLOW.pop(u.id, None)
@@ -936,28 +942,46 @@ async def keypad_router(update, ctx):
         if len(cur) < 4:
             cur = (cur + digit).lstrip("0") or "0"
             flow["data"]["reward_str"] = cur
-            await q.edit_message_reply_markup(reply_markup=reward_keypad_kb(cur))
+            try:
+                await q.edit_message_reply_markup(reply_markup=reward_keypad_kb(cur))
+            except TelegramError as e:
+                logging.error(f"keypad digit edit failed: {e}")
     elif action == "back":
         cur = cur[:-1]
         flow["data"]["reward_str"] = cur
-        await q.edit_message_reply_markup(reply_markup=reward_keypad_kb(cur))
+        try:
+            await q.edit_message_reply_markup(reply_markup=reward_keypad_kb(cur))
+        except TelegramError as e:
+            logging.error(f"keypad back edit failed: {e}")
     elif action == "done":
         if not cur or cur == "0":
             await q.answer("Enter a value first.", show_alert=True); return
         val = int(cur)
         if val < 1 or val > TASK_REWARD_CAP:
             await q.answer(f"Must be 1–{TASK_REWARD_CAP}.", show_alert=True); return
+        if "channel" not in flow["data"]:
+            await q.answer("Session expired — start over.", show_alert=True)
+            ADMIN_FLOW.pop(u.id, None)
+            return
         flow["data"]["reward"] = val
         flow["step"] = "title"
-        await q.edit_message_text(
-            f"✅ Channel: `{flow['data']['channel']}`\n"
-            f"✅ Reward: *{val}* ⭐\n\n"
-            f"➕ *Step 3 of 3*\n\n"
-            f"Send the task title as text in the chat.\n"
-            f"Example: `Join NCK DEV`",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖ Cancel", callback_data="a:panel")]]))
+        ch = flow["data"]["channel"]
+        try:
+            await q.edit_message_text(
+                f"✅ Channel: `{ch}`\n"
+                f"✅ Reward: *{val}* ⭐\n\n"
+                f"➕ *Step 3 of 3*\n\n"
+                f"Send the task title as text in the chat.\n"
+                f"Example: `Join NCK DEV`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✖ Cancel", callback_data="a:panel")]]))
+        except TelegramError as e:
+            logging.error(f"keypad done edit failed: {e}")
+            await q.message.reply_text(
+                f"✅ Reward: *{val}* ⭐\n\n"
+                f"Now send the task title as text in the chat.",
+                parse_mode="Markdown")
 
 
 # ---------------- Queue & matchmaking ----------------
@@ -1367,6 +1391,11 @@ def main():
     gh_backup_loop(interval=300, debounce=BACKUP_DEBOUNCE)
 
     app = Application.builder().token(TOKEN).build()
+
+    async def on_error(update, ctx):
+        logging.error(f"handler error: {ctx.error}", exc_info=ctx.error)
+
+    app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel_match))
