@@ -23,7 +23,7 @@ HOUSE_POOL_START = int(os.getenv("HOUSE_POOL_START", "10000"))
 HOUSE_REFILL = int(os.getenv("HOUSE_REFILL", "500"))
 TASK_REWARD_CAP = int(os.getenv("TASK_REWARD_CAP", "500"))
 BACKUP_DEBOUNCE = int(os.getenv("BACKUP_DEBOUNCE", "30"))
-SESSION_TTL = int(os.getenv("SESSION_TTL", "900"))  # 15 minutes
+SESSION_TTL = int(os.getenv("SESSION_TTL", "900"))
 FORCE_CHANNELS = [c.strip() for c in os.getenv("FORCE_CHANNELS", "").split(",") if c.strip()]
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
@@ -251,11 +251,15 @@ def init_db():
         admin_id INTEGER, action TEXT, details TEXT,
         created_at TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS sessions(
-        user_id INTEGER PRIMARY KEY,
+        user_id INTEGER,
         chat_id INTEGER,
-        kind TEXT,
-        data TEXT,
-        created_at INTEGER)""")
+        state TEXT,
+        payload TEXT,
+        accepts TEXT,
+        prefix TEXT,
+        expires INTEGER,
+        PRIMARY KEY (user_id, chat_id))""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires)")
     con.commit()
     cur.execute("INSERT OR IGNORE INTO house(id,pool,last_refill) VALUES(1,?,?)",
                 (HOUSE_POOL_START, str(int(time.time()))))
@@ -404,45 +408,121 @@ def task_stats():
 
 
 # ---------------- Sessions ----------------
-def session_start(uid, chat_id, kind, data=None):
-    with _db_lock:
-        con = db(); cur = con.cursor()
-        cur.execute("""INSERT INTO sessions(user_id, chat_id, kind, data, created_at)
-                       VALUES(?,?,?,?,?)
-                       ON CONFLICT(user_id) DO UPDATE SET
-                           chat_id=excluded.chat_id,
-                           kind=excluded.kind,
-                           data=excluded.data,
-                           created_at=excluded.created_at""",
-                    (uid, chat_id, kind, json.dumps(data or {}), int(time.time())))
-        con.commit(); con.close()
-    mark_dirty()
+class SessionManager:
+    def open(self, uid, chat_id, state, payload=None, accepts="text",
+             prefix=None, ttl=None):
+        ttl = ttl or SESSION_TTL
+        expires = int(time.time()) + ttl
+        payload_json = json.dumps(payload or {})
+        with _db_lock:
+            con = db(); cur = con.cursor()
+            cur.execute("""INSERT INTO sessions(user_id, chat_id, state, payload,
+                                                accepts, prefix, expires)
+                           VALUES(?,?,?,?,?,?,?)
+                           ON CONFLICT(user_id, chat_id) DO UPDATE SET
+                               state=excluded.state,
+                               payload=excluded.payload,
+                               accepts=excluded.accepts,
+                               prefix=excluded.prefix,
+                               expires=excluded.expires""",
+                        (uid, chat_id, state, payload_json, accepts, prefix, expires))
+            con.commit(); con.close()
+        mark_dirty()
 
-def session_get(uid, chat_id=None):
-    with _db_lock:
-        con = db(); cur = con.cursor()
-        cur.execute("SELECT user_id, chat_id, kind, data, created_at FROM sessions WHERE user_id=?", (uid,))
-        r = cur.fetchone(); con.close()
-    if not r:
-        return None
-    _, s_chat, kind, data_json, created = r
-    if time.time() - created > SESSION_TTL:
-        session_clear(uid)
-        return None
-    if chat_id is not None and s_chat != chat_id:
-        return None
-    try:
-        data = json.loads(data_json) if data_json else {}
-    except Exception:
-        data = {}
-    return {"user_id": uid, "chat_id": s_chat, "kind": kind, "data": data}
+    def _row(self, uid, chat_id):
+        with _db_lock:
+            con = db(); cur = con.cursor()
+            cur.execute("""SELECT state, payload, accepts, prefix, expires
+                           FROM sessions WHERE user_id=? AND chat_id=?""",
+                        (uid, chat_id))
+            r = cur.fetchone()
+            if r and r[4] < int(time.time()):
+                cur.execute("DELETE FROM sessions WHERE user_id=? AND chat_id=?",
+                            (uid, chat_id))
+                con.commit()
+                r = None
+            con.close()
+        return r
 
-def session_clear(uid):
-    with _db_lock:
-        con = db(); cur = con.cursor()
-        cur.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
-        con.commit(); con.close()
-    mark_dirty()
+    def peek(self, uid, chat_id):
+        r = self._row(uid, chat_id)
+        if not r: return None
+        state, payload_json, accepts, prefix, expires = r
+        try: payload = json.loads(payload_json or "{}")
+        except Exception: payload = {}
+        return {"state": state, "payload": payload,
+                "accepts": accepts, "prefix": prefix, "expires": expires}
+
+    def consume_text(self, uid, chat_id, expected_state=None):
+        s = self.peek(uid, chat_id)
+        if not s: return None
+        if s["accepts"] != "text": return None
+        if expected_state and s["state"] != expected_state: return None
+        self._delete(uid, chat_id)
+        return s
+
+    def consume_callback(self, uid, chat_id, prefix=None, expected_state=None):
+        s = self.peek(uid, chat_id)
+        if not s: return None
+        if s["accepts"] != "callback": return None
+        if expected_state and s["state"] != expected_state: return None
+        if prefix and s["prefix"] and not prefix.startswith(s["prefix"]):
+            return None
+        self._delete(uid, chat_id)
+        return s
+
+    def _delete(self, uid, chat_id):
+        with _db_lock:
+            con = db(); cur = con.cursor()
+            cur.execute("DELETE FROM sessions WHERE user_id=? AND chat_id=?",
+                        (uid, chat_id))
+            con.commit(); con.close()
+        mark_dirty()
+
+    def close(self, uid, chat_id=None):
+        with _db_lock:
+            con = db(); cur = con.cursor()
+            if chat_id is None:
+                cur.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+            else:
+                cur.execute("DELETE FROM sessions WHERE user_id=? AND chat_id=?",
+                            (uid, chat_id))
+            con.commit(); con.close()
+        mark_dirty()
+
+    def sweep(self):
+        now = int(time.time())
+        with _db_lock:
+            con = db(); cur = con.cursor()
+            cur.execute("DELETE FROM sessions WHERE expires < ?", (now,))
+            n = cur.rowcount
+            con.commit(); con.close()
+        if n:
+            mark_dirty()
+            logging.info(f"[sessions] swept {n}")
+        return n
+
+    def active_count(self):
+        now = int(time.time())
+        with _db_lock:
+            con = db(); cur = con.cursor()
+            cur.execute("SELECT COUNT(*) FROM sessions WHERE expires >= ?", (now,))
+            n = cur.fetchone()[0]; con.close()
+        return n
+
+
+sessions = SessionManager()
+
+
+def session_sweep_loop(interval=60):
+    def loop():
+        while True:
+            time.sleep(interval)
+            try: sessions.sweep()
+            except Exception as e:
+                logging.error(f"[sessions] sweep failed: {e}")
+    threading.Thread(target=loop, daemon=True, name="session-sweep").start()
+    logging.info(f"session sweep loop started ({interval}s)")
 
 
 def profile_card(uid, name):
@@ -562,6 +642,43 @@ def reward_keypad_kb(current=""):
     ]
     return InlineKeyboardMarkup(rows)
 
+def title_picker_kb(channel):
+    name = channel.lstrip("@")
+    presets = [
+        ("📢", f"Join {name}",             "join"),
+        ("🔔", f"Subscribe to {name}",     "sub"),
+        ("➕", f"Follow {name}",           "fol"),
+        ("🎁", f"Get free codes at {name}","free"),
+        ("👀", f"Check out {name}",        "check"),
+    ]
+    rows = []
+    for emoji, label, key in presets:
+        rows.append([InlineKeyboardButton(
+            f"{emoji} {label}",
+            callback_data=f"tt:{key}:{channel}"
+        )])
+    rows.append([InlineKeyboardButton("✏️ Custom title", callback_data="tt:custom:.")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tt:back:.")])
+    return InlineKeyboardMarkup(rows)
+
+def admin_task_list_kb(tasks):
+    """Build a keyboard with a 🗑️ button per task, plus Back."""
+    rows = []
+    for tid, ch, reward, title in tasks:
+        rows.append([
+            InlineKeyboardButton(f"🗑️ #{tid}",
+                                 callback_data=f"a:delask:{tid}"),
+            InlineKeyboardButton(f"{title[:28]}", callback_data="a:noop"),
+        ])
+    rows.append([InlineKeyboardButton("⬅️ Admin Panel", callback_data="a:panel")])
+    return InlineKeyboardMarkup(rows)
+
+def confirm_delete_kb(tid):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️ Yes, delete", callback_data=f"a:delyes:{tid}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="a:list")],
+    ])
+
 
 CHANNEL_LABELS = ["⧉ ERROR/404", "📦 NCK DEV Source Codes", "🛠️ NCK DEV"]
 
@@ -670,8 +787,7 @@ async def start(update, ctx):
 
 async def cancel_match(update, ctx):
     u = update.effective_user
-    # clear any admin session first
-    session_clear(u.id)
+    sessions.close(u.id)
     gid_found = None
     for gid, g in GAMES.items():
         all_ids = [p["uid"] for p in g["teams"][0]] + [p["uid"] for p in g["teams"][1]]
@@ -880,9 +996,11 @@ async def admin_router(update, ctx):
     parts = q.data.split(":")
     sub = parts[1] if len(parts) > 1 else "panel"
 
+    if sub == "noop":
+        return
+
     if sub == "panel":
-        # clear any stale session when re-opening the panel
-        session_clear(u.id)
+        sessions.close(u.id, q.message.chat_id)
         active, completions = task_stats()
         await q.edit_message_text(
             f"⚙️ *Admin Panel*\n\n"
@@ -899,106 +1017,137 @@ async def admin_router(update, ctx):
         tasks = list_tasks(active_only=True)
         if not tasks:
             await q.edit_message_text("No active tasks.", reply_markup=admin_back()); return
-        lines = ["⚙️ *Active Tasks*\n"]
-        for tid, ch, reward, title in tasks:
-            lines.append(f"`#{tid}` — {safe(title)} → {ch} ({reward}⭐)")
         await q.edit_message_text(
-            "\n".join(lines), parse_mode="Markdown", reply_markup=admin_back())
+            "⚙️ *Active Tasks*\n\n"
+            "Tap 🗑️ next to any task to delete it:",
+            parse_mode="Markdown",
+            reply_markup=admin_task_list_kb(tasks))
+
+    elif sub == "delask":
+        tid = int(parts[2])
+        t = get_task(tid)
+        if not t or t[4] == 0:
+            await q.answer("Task already gone.", show_alert=True); return
+        _, ch, reward, title, active = t
+        await q.edit_message_text(
+            f"🗑️ *Confirm delete*\n\n"
+            f"Task `#{tid}`\n"
+            f"Title: {safe(title)}\n"
+            f"Channel: {ch}\n"
+            f"Reward: *{reward}* ⭐\n\n"
+            f"Delete this task? Users who already completed it keep their stars.",
+            parse_mode="Markdown",
+            reply_markup=confirm_delete_kb(tid))
+
+    elif sub == "delyes":
+        tid = int(parts[2])
+        t = get_task(tid)
+        if not t or t[4] == 0:
+            await q.answer("Already deleted.", show_alert=True); return
+        _, ch, reward, title, active = t
+        delete_task(tid)
+        log_admin(u.id, "deltask", f"#{tid} {ch} {reward} {title}")
+        await q.answer(f"✅ Task #{tid} deleted.")
+        tasks = list_tasks(active_only=True)
+        if not tasks:
+            await q.edit_message_text(
+                f"✅ Deleted task `#{tid}`.\n\nNo active tasks remaining.",
+                parse_mode="Markdown",
+                reply_markup=admin_back())
+            return
+        await q.edit_message_text(
+            f"✅ Deleted task `#{tid}`.\n\n*Active Tasks:*",
+            parse_mode="Markdown",
+            reply_markup=admin_task_list_kb(tasks))
 
     elif sub == "new":
-        session_start(u.id, q.message.chat_id, "task_channel", {})
+        sessions.open(u.id, q.message.chat_id, "task_channel", {}, accepts="text")
         await q.edit_message_text(
             "➕ *Create Task — Step 1 of 3*\n\n"
             "Send me the channel username in the chat.\n\n"
-            "Example: `@NCK_Dev`\n\n"
-            f"_Session expires in {SESSION_TTL // 60} min._",
+            "Example: `@NCK_Dev`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✖ Cancel", callback_data="a:panel")]]))
 
-    elif sub == "del":
-        tid = int(parts[2])
-        delete_task(tid)
-        log_admin(u.id, "deltask", f"#{tid}")
-        await q.answer(f"✅ Task #{tid} deactivated.")
-        tasks = list_tasks(active_only=True)
-        if not tasks:
-            await q.edit_message_text("No active tasks.", reply_markup=admin_back()); return
-        lines = ["⚙️ *Active Tasks*\n"]
-        for t in tasks:
-            lines.append(f"`#{t[0]}` — {safe(t[3])} → {t[1]} ({t[2]}⭐)")
-        await q.edit_message_text(
-            "\n".join(lines), parse_mode="Markdown", reply_markup=admin_back())
-
 
 async def admin_message(update, ctx):
-    """Handles text when a session is active for this user in this chat."""
-    u = update.effective_user
-    if not is_admin(u.id):
-        return
-    chat_id = update.message.chat_id
-    sess = session_get(u.id, chat_id)
-    if not sess:
-        return
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-    kind = sess["kind"]
-    data = sess["data"]
+    try:
+        u = update.effective_user
+        if not u or not update.message: return
+        if not is_admin(u.id): return
+        text = (update.message.text or "").strip()
+        if not text: return
+        chat_id = update.message.chat_id
 
-    if kind == "task_channel":
-        if not text.startswith("@"):
-            text = "@" + text
-        data["channel"] = text
-        session_start(u.id, chat_id, "task_reward", data)
-        await update.message.reply_text(
-            f"✅ Channel: `{text}`\n\n"
-            f"➕ *Step 2 of 3*\n\n"
-            f"Tap the keypad to enter the reward (1–{TASK_REWARD_CAP}).\n"
-            f"Then tap ✅ Done.",
-            parse_mode="Markdown",
-            reply_markup=reward_keypad_kb(""))
+        sess = sessions.consume_text(u.id, chat_id)
+        if not sess: return
 
-    elif kind == "task_title":
-        data["title"] = text[:64]
-        ch = data.get("channel")
-        rw = data.get("reward")
-        if not ch or not rw:
-            session_clear(u.id)
+        state = sess["state"]
+        data = sess["payload"]
+
+        if state == "task_channel":
+            if not text.startswith("@"):
+                text = "@" + text
+            sessions.open(u.id, chat_id, "task_reward",
+                          {"channel": text, "reward_str": ""},
+                          accepts="callback", prefix="k:")
             await update.message.reply_text(
-                "⚠️ Session data missing — start over from the Admin Panel.",
-                reply_markup=admin_back())
-            return
-        try:
-            tid = create_task(ch, rw, data["title"], u.id)
-            log_admin(u.id, "newtask", f"#{tid} {ch} {rw} {data['title']}")
-        except Exception as e:
-            logging.error(f"create_task failed: {e}", exc_info=e)
-            await update.message.reply_text(
-                f"❌ *Task creation failed*\n\n`{e}`\n\nTry again.",
+                f"✅ Channel: `{text}`\n\n"
+                f"➕ *Step 2 of 3*\n\n"
+                f"Tap the keypad to enter the reward (1–{TASK_REWARD_CAP}).\n"
+                f"Then tap ✅ Done.",
                 parse_mode="Markdown",
-                reply_markup=admin_back())
+                reply_markup=reward_keypad_kb(""))
             return
-        session_clear(u.id)
-        await update.message.reply_text(
-            f"✅ *Task Created*\n\n"
-            f"ID: `#{tid}`\nChannel: {ch}\n"
-            f"Reward: *{rw}* ⭐\nTitle: {safe(data['title'])}",
-            parse_mode="Markdown",
-            reply_markup=admin_back())
+
+        if state == "task_title_custom":
+            ch = data.get("channel")
+            rw = data.get("reward")
+            if not ch or not rw:
+                await update.message.reply_text(
+                    "⚠️ Session data missing — start over.",
+                    reply_markup=admin_back())
+                return
+            title = text[:64]
+            try:
+                tid = create_task(ch, rw, title, u.id)
+                log_admin(u.id, "newtask", f"#{tid} {ch} {rw} {title}")
+            except Exception as e:
+                logging.error(f"create_task failed: {e}", exc_info=e)
+                await update.message.reply_text(
+                    f"❌ *Task creation failed*\n\n`{e}`",
+                    parse_mode="Markdown", reply_markup=admin_back())
+                return
+            await update.message.reply_text(
+                f"✅ *Task Created*\n\n"
+                f"ID: `#{tid}`\nChannel: {ch}\n"
+                f"Reward: *{rw}* ⭐\nTitle: {safe(title)}",
+                parse_mode="Markdown", reply_markup=admin_back())
+            return
+
+    except Exception as e:
+        logging.error(f"[admin_message] crashed: {e}", exc_info=e)
+        try:
+            await update.message.reply_text(
+                f"❌ *Error*\n\n`{type(e).__name__}: {e}`",
+                parse_mode="Markdown")
+        except Exception: pass
 
 
 async def keypad_router(update, ctx):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
     u = q.from_user
     if not is_admin(u.id):
         await q.answer("Admins only.", show_alert=True); return
     chat_id = q.message.chat_id
-    sess = session_get(u.id, chat_id)
-    if not sess or sess["kind"] != "task_reward":
-        await q.answer("Session expired.", show_alert=True); return
-    data = sess["data"]
 
+    sess = sessions.peek(u.id, chat_id)
+    if not sess or sess["state"] != "task_reward":
+        await q.answer("Session expired.", show_alert=True); return
+
+    await q.answer()
+    data = sess["payload"]
     parts = q.data.split(":")
     action = parts[1] if len(parts) > 1 else "noop"
     cur = data.get("reward_str", "")
@@ -1010,7 +1159,8 @@ async def keypad_router(update, ctx):
         if len(cur) < 4:
             cur = (cur + digit).lstrip("0") or "0"
             data["reward_str"] = cur
-            session_start(u.id, chat_id, "task_reward", data)
+            sessions.open(u.id, chat_id, "task_reward", data,
+                          accepts="callback", prefix="k:")
             try:
                 await q.edit_message_reply_markup(reply_markup=reward_keypad_kb(cur))
             except TelegramError as e:
@@ -1018,7 +1168,8 @@ async def keypad_router(update, ctx):
     elif action == "back":
         cur = cur[:-1]
         data["reward_str"] = cur
-        session_start(u.id, chat_id, "task_reward", data)
+        sessions.open(u.id, chat_id, "task_reward", data,
+                      accepts="callback", prefix="k:")
         try:
             await q.edit_message_reply_markup(reply_markup=reward_keypad_kb(cur))
         except TelegramError as e:
@@ -1030,24 +1181,123 @@ async def keypad_router(update, ctx):
         if val < 1 or val > TASK_REWARD_CAP:
             await q.answer(f"Must be 1–{TASK_REWARD_CAP}.", show_alert=True); return
         data["reward"] = val
-        session_start(u.id, chat_id, "task_title", data)
         ch = data.get("channel", "?")
+        sessions.open(u.id, chat_id, "task_title", data,
+                      accepts="callback", prefix="tt:")
         try:
             await q.edit_message_text(
                 f"✅ Channel: `{ch}`\n"
                 f"✅ Reward: *{val}* ⭐\n\n"
-                f"➕ *Step 3 of 3*\n\n"
+                f"➕ *Step 3 of 3 — choose a title:*",
+                parse_mode="Markdown",
+                reply_markup=title_picker_kb(ch))
+        except TelegramError as e:
+            logging.error(f"keypad done edit failed: {e}")
+            await q.message.reply_text(
+                f"✅ Reward: *{val}* ⭐\n\nChoose a title:",
+                parse_mode="Markdown",
+                reply_markup=title_picker_kb(ch))
+
+
+async def title_router(update, ctx):
+    q = update.callback_query
+    u = q.from_user
+    if not is_admin(u.id):
+        await q.answer("Admins only.", show_alert=True); return
+    chat_id = q.message.chat_id
+
+    parts = q.data.split(":", 2)
+    if len(parts) < 3:
+        await q.answer("Bad callback.", show_alert=True); return
+    action, payload = parts[1], parts[2]
+
+    if action == "back":
+        sess = sessions.peek(u.id, chat_id)
+        if not sess or sess["state"] != "task_title":
+            await q.answer("Session expired.", show_alert=True); return
+        data = sess["payload"]
+        ch = data.get("channel", "?")
+        val = data.get("reward", 0)
+        sessions.open(u.id, chat_id, "task_reward",
+                      {**data, "reward_str": str(val)},
+                      accepts="callback", prefix="k:")
+        await q.answer()
+        try:
+            await q.edit_message_text(
+                f"✅ Channel: `{ch}`\n\n"
+                f"➕ *Step 2 of 3*\n\n"
+                f"Tap the keypad to change the reward, or tap ✅ Done again.",
+                parse_mode="Markdown",
+                reply_markup=reward_keypad_kb(str(val)))
+        except TelegramError as e:
+            logging.error(f"title back edit failed: {e}")
+        return
+
+    if action == "custom":
+        sess = sessions.peek(u.id, chat_id)
+        if not sess or sess["state"] != "task_title":
+            await q.answer("Session expired.", show_alert=True); return
+        data = sess["payload"]
+        ch = data.get("channel", "?")
+        val = data.get("reward", 0)
+        sessions.open(u.id, chat_id, "task_title_custom", data, accepts="text")
+        await q.answer()
+        try:
+            await q.edit_message_text(
+                f"✏️ *Custom title*\n\n"
+                f"Channel: `{ch}`\nReward: *{val}* ⭐\n\n"
                 f"Send the task title as text in the chat.\n"
                 f"Example: `Join NCK DEV`",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("✖ Cancel", callback_data="a:panel")]]))
         except TelegramError as e:
-            logging.error(f"keypad done edit failed: {e}")
-            await q.message.reply_text(
-                f"✅ Reward: *{val}* ⭐\n\n"
-                f"Now send the task title as text in the chat.",
-                parse_mode="Markdown")
+            logging.error(f"title custom edit failed: {e}")
+        return
+
+    sess = sessions.consume_callback(u.id, chat_id, prefix="tt:",
+                                     expected_state="task_title")
+    if not sess:
+        await q.answer("Session expired — start over.", show_alert=True)
+        return
+
+    data = sess["payload"]
+    reward = data.get("reward")
+    ch = data.get("channel") or payload
+    if not ch or not reward:
+        await q.answer("Session data missing.", show_alert=True)
+        return
+
+    name = ch.lstrip("@")
+    title_map = {
+        "join":  f"Join {name}",
+        "sub":   f"Subscribe to {name}",
+        "fol":   f"Follow {name}",
+        "free":  f"Get free codes at {name}",
+        "check": f"Check out {name}",
+    }
+    title = title_map.get(action)
+    if not title:
+        await q.answer("Unknown preset.", show_alert=True); return
+
+    try:
+        tid = create_task(ch, reward, title, u.id)
+        log_admin(u.id, "newtask", f"#{tid} {ch} {reward} {title}")
+    except Exception as e:
+        logging.error(f"create_task failed: {e}", exc_info=e)
+        await q.edit_message_text(
+            f"❌ *Task creation failed*\n\n`{e}`",
+            parse_mode="Markdown",
+            reply_markup=admin_back())
+        return
+
+    await q.answer("✅ Task created!")
+    await q.edit_message_text(
+        f"✅ *Task Created*\n\n"
+        f"ID: `#{tid}`\nChannel: {ch}\n"
+        f"Reward: *{reward}* ⭐\nTitle: {safe(title)}",
+        parse_mode="Markdown",
+        reply_markup=admin_back())
 
 
 # ---------------- Queue & matchmaking ----------------
@@ -1455,6 +1705,7 @@ def main():
     start_keepalive_loop(interval=600)
     init_db()
     gh_backup_loop(interval=300, debounce=BACKUP_DEBOUNCE)
+    session_sweep_loop(interval=60)
 
     app = Application.builder().token(TOKEN).build()
 
@@ -1472,6 +1723,7 @@ def main():
     app.add_handler(CallbackQueryHandler(queue_router, pattern=r"^q"))
     app.add_handler(CallbackQueryHandler(cancel_queue, pattern=r"^cq:"))
     app.add_handler(CallbackQueryHandler(card_play, pattern=r"^c:"))
+    app.add_handler(CallbackQueryHandler(title_router, pattern=r"^tt:"))
     app.add_handler(CallbackQueryHandler(tasks_router, pattern=r"^t:"))
     app.add_handler(CallbackQueryHandler(admin_router, pattern=r"^a:"))
     app.add_handler(CallbackQueryHandler(keypad_router, pattern=r"^k:"))
