@@ -250,6 +250,13 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         admin_id INTEGER, action TEXT, details TEXT,
         created_at TEXT)""")
+
+    # Sessions: transient state — if schema changed, drop and recreate.
+    cur.execute("PRAGMA table_info(sessions)")
+    cols = [row[1] for row in cur.fetchall()]
+    if cols and ("state" not in cols or "expires" not in cols):
+        logging.info(f"[init_db] sessions schema outdated ({cols}) — dropping table")
+        cur.execute("DROP TABLE sessions")
     cur.execute("""CREATE TABLE IF NOT EXISTS sessions(
         user_id INTEGER,
         chat_id INTEGER,
@@ -260,6 +267,7 @@ def init_db():
         expires INTEGER,
         PRIMARY KEY (user_id, chat_id))""")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires)")
+
     con.commit()
     cur.execute("INSERT OR IGNORE INTO house(id,pool,last_refill) VALUES(1,?,?)",
                 (HOUSE_POOL_START, str(int(time.time()))))
@@ -662,12 +670,10 @@ def title_picker_kb(channel):
     return InlineKeyboardMarkup(rows)
 
 def admin_task_list_kb(tasks):
-    """Build a keyboard with a 🗑️ button per task, plus Back."""
     rows = []
     for tid, ch, reward, title in tasks:
         rows.append([
-            InlineKeyboardButton(f"🗑️ #{tid}",
-                                 callback_data=f"a:delask:{tid}"),
+            InlineKeyboardButton(f"🗑️ #{tid}", callback_data=f"a:delask:{tid}"),
             InlineKeyboardButton(f"{title[:28]}", callback_data="a:noop"),
         ])
     rows.append([InlineKeyboardButton("⬅️ Admin Panel", callback_data="a:panel")])
@@ -1018,8 +1024,7 @@ async def admin_router(update, ctx):
         if not tasks:
             await q.edit_message_text("No active tasks.", reply_markup=admin_back()); return
         await q.edit_message_text(
-            "⚙️ *Active Tasks*\n\n"
-            "Tap 🗑️ next to any task to delete it:",
+            "⚙️ *Active Tasks*\n\nTap 🗑️ next to any task to delete it:",
             parse_mode="Markdown",
             reply_markup=admin_task_list_kb(tasks))
 
@@ -1031,10 +1036,7 @@ async def admin_router(update, ctx):
         _, ch, reward, title, active = t
         await q.edit_message_text(
             f"🗑️ *Confirm delete*\n\n"
-            f"Task `#{tid}`\n"
-            f"Title: {safe(title)}\n"
-            f"Channel: {ch}\n"
-            f"Reward: *{reward}* ⭐\n\n"
+            f"Task `#{tid}`\nTitle: {safe(title)}\nChannel: {ch}\nReward: *{reward}* ⭐\n\n"
             f"Delete this task? Users who already completed it keep their stars.",
             parse_mode="Markdown",
             reply_markup=confirm_delete_kb(tid))
