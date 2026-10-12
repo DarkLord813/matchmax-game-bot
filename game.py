@@ -1,4 +1,4 @@
-import os, sqlite3, random, logging, asyncio, base64, threading, time, requests
+import os, sqlite3, random, logging, asyncio, base64, threading, time, requests, json
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
@@ -23,6 +23,7 @@ HOUSE_POOL_START = int(os.getenv("HOUSE_POOL_START", "10000"))
 HOUSE_REFILL = int(os.getenv("HOUSE_REFILL", "500"))
 TASK_REWARD_CAP = int(os.getenv("TASK_REWARD_CAP", "500"))
 BACKUP_DEBOUNCE = int(os.getenv("BACKUP_DEBOUNCE", "30"))
+SESSION_TTL = int(os.getenv("SESSION_TTL", "900"))  # 15 minutes
 FORCE_CHANNELS = [c.strip() for c in os.getenv("FORCE_CHANNELS", "").split(",") if c.strip()]
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
@@ -249,6 +250,12 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         admin_id INTEGER, action TEXT, details TEXT,
         created_at TEXT)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS sessions(
+        user_id INTEGER PRIMARY KEY,
+        chat_id INTEGER,
+        kind TEXT,
+        data TEXT,
+        created_at INTEGER)""")
     con.commit()
     cur.execute("INSERT OR IGNORE INTO house(id,pool,last_refill) VALUES(1,?,?)",
                 (HOUSE_POOL_START, str(int(time.time()))))
@@ -396,6 +403,48 @@ def task_stats():
     return active, completions
 
 
+# ---------------- Sessions ----------------
+def session_start(uid, chat_id, kind, data=None):
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("""INSERT INTO sessions(user_id, chat_id, kind, data, created_at)
+                       VALUES(?,?,?,?,?)
+                       ON CONFLICT(user_id) DO UPDATE SET
+                           chat_id=excluded.chat_id,
+                           kind=excluded.kind,
+                           data=excluded.data,
+                           created_at=excluded.created_at""",
+                    (uid, chat_id, kind, json.dumps(data or {}), int(time.time())))
+        con.commit(); con.close()
+    mark_dirty()
+
+def session_get(uid, chat_id=None):
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("SELECT user_id, chat_id, kind, data, created_at FROM sessions WHERE user_id=?", (uid,))
+        r = cur.fetchone(); con.close()
+    if not r:
+        return None
+    _, s_chat, kind, data_json, created = r
+    if time.time() - created > SESSION_TTL:
+        session_clear(uid)
+        return None
+    if chat_id is not None and s_chat != chat_id:
+        return None
+    try:
+        data = json.loads(data_json) if data_json else {}
+    except Exception:
+        data = {}
+    return {"user_id": uid, "chat_id": s_chat, "kind": kind, "data": data}
+
+def session_clear(uid):
+    with _db_lock:
+        con = db(); cur = con.cursor()
+        cur.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+        con.commit(); con.close()
+    mark_dirty()
+
+
 def profile_card(uid, name):
     _,_,s,e,st,last,w,l,seen = get_user(uid, name)
     lv, into, need = exp_progress(e)
@@ -432,7 +481,6 @@ def profile_card(uid, name):
 GAMES = {}
 QUEUES = {"solo": [], "duo": [], "squad": []}
 NEXT_GID = [1000]
-ADMIN_FLOW = {}
 
 def new_gid():
     NEXT_GID[0] += 1
@@ -622,6 +670,8 @@ async def start(update, ctx):
 
 async def cancel_match(update, ctx):
     u = update.effective_user
+    # clear any admin session first
+    session_clear(u.id)
     gid_found = None
     for gid, g in GAMES.items():
         all_ids = [p["uid"] for p in g["teams"][0]] + [p["uid"] for p in g["teams"][1]]
@@ -831,6 +881,8 @@ async def admin_router(update, ctx):
     sub = parts[1] if len(parts) > 1 else "panel"
 
     if sub == "panel":
+        # clear any stale session when re-opening the panel
+        session_clear(u.id)
         active, completions = task_stats()
         await q.edit_message_text(
             f"⚙️ *Admin Panel*\n\n"
@@ -854,11 +906,12 @@ async def admin_router(update, ctx):
             "\n".join(lines), parse_mode="Markdown", reply_markup=admin_back())
 
     elif sub == "new":
-        ADMIN_FLOW[u.id] = {"step": "channel", "data": {}}
+        session_start(u.id, q.message.chat_id, "task_channel", {})
         await q.edit_message_text(
             "➕ *Create Task — Step 1 of 3*\n\n"
             "Send me the channel username in the chat.\n\n"
-            "Example: `@NCK_Dev`",
+            "Example: `@NCK_Dev`\n\n"
+            f"_Session expires in {SESSION_TTL // 60} min._",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✖ Cancel", callback_data="a:panel")]]))
@@ -879,21 +932,25 @@ async def admin_router(update, ctx):
 
 
 async def admin_message(update, ctx):
+    """Handles text when a session is active for this user in this chat."""
     u = update.effective_user
     if not is_admin(u.id):
         return
-    flow = ADMIN_FLOW.get(u.id)
-    if not flow:
+    chat_id = update.message.chat_id
+    sess = session_get(u.id, chat_id)
+    if not sess:
         return
     text = (update.message.text or "").strip()
-    step = flow["step"]
+    if not text:
+        return
+    kind = sess["kind"]
+    data = sess["data"]
 
-    if step == "channel":
+    if kind == "task_channel":
         if not text.startswith("@"):
             text = "@" + text
-        flow["data"]["channel"] = text
-        flow["step"] = "reward"
-        flow["data"]["reward_str"] = ""
+        data["channel"] = text
+        session_start(u.id, chat_id, "task_reward", data)
         await update.message.reply_text(
             f"✅ Channel: `{text}`\n\n"
             f"➕ *Step 2 of 3*\n\n"
@@ -902,22 +959,31 @@ async def admin_message(update, ctx):
             parse_mode="Markdown",
             reply_markup=reward_keypad_kb(""))
 
-    elif step == "title":
-        flow["data"]["title"] = text[:64]
-        d = flow["data"]
-        if "channel" not in d or "reward" not in d:
-            ADMIN_FLOW.pop(u.id, None)
+    elif kind == "task_title":
+        data["title"] = text[:64]
+        ch = data.get("channel")
+        rw = data.get("reward")
+        if not ch or not rw:
+            session_clear(u.id)
             await update.message.reply_text(
-                "⚠️ Session expired — start over from the Admin Panel.",
+                "⚠️ Session data missing — start over from the Admin Panel.",
                 reply_markup=admin_back())
             return
-        tid = create_task(d["channel"], d["reward"], d["title"], u.id)
-        log_admin(u.id, "newtask", f"#{tid} {d['channel']} {d['reward']} {d['title']}")
-        ADMIN_FLOW.pop(u.id, None)
+        try:
+            tid = create_task(ch, rw, data["title"], u.id)
+            log_admin(u.id, "newtask", f"#{tid} {ch} {rw} {data['title']}")
+        except Exception as e:
+            logging.error(f"create_task failed: {e}", exc_info=e)
+            await update.message.reply_text(
+                f"❌ *Task creation failed*\n\n`{e}`\n\nTry again.",
+                parse_mode="Markdown",
+                reply_markup=admin_back())
+            return
+        session_clear(u.id)
         await update.message.reply_text(
             f"✅ *Task Created*\n\n"
-            f"ID: `#{tid}`\nChannel: {d['channel']}\n"
-            f"Reward: *{d['reward']}* ⭐\nTitle: {safe(d['title'])}",
+            f"ID: `#{tid}`\nChannel: {ch}\n"
+            f"Reward: *{rw}* ⭐\nTitle: {safe(data['title'])}",
             parse_mode="Markdown",
             reply_markup=admin_back())
 
@@ -927,28 +993,32 @@ async def keypad_router(update, ctx):
     u = q.from_user
     if not is_admin(u.id):
         await q.answer("Admins only.", show_alert=True); return
-    flow = ADMIN_FLOW.get(u.id)
-    if not flow or flow["step"] != "reward":
+    chat_id = q.message.chat_id
+    sess = session_get(u.id, chat_id)
+    if not sess or sess["kind"] != "task_reward":
         await q.answer("Session expired.", show_alert=True); return
+    data = sess["data"]
 
-    data = q.data.split(":")
-    action = data[1] if len(data) > 1 else "noop"
-    cur = flow["data"].get("reward_str", "")
+    parts = q.data.split(":")
+    action = parts[1] if len(parts) > 1 else "noop"
+    cur = data.get("reward_str", "")
 
     if action == "noop":
         return
     elif action == "d":
-        digit = data[2]
+        digit = parts[2]
         if len(cur) < 4:
             cur = (cur + digit).lstrip("0") or "0"
-            flow["data"]["reward_str"] = cur
+            data["reward_str"] = cur
+            session_start(u.id, chat_id, "task_reward", data)
             try:
                 await q.edit_message_reply_markup(reply_markup=reward_keypad_kb(cur))
             except TelegramError as e:
                 logging.error(f"keypad digit edit failed: {e}")
     elif action == "back":
         cur = cur[:-1]
-        flow["data"]["reward_str"] = cur
+        data["reward_str"] = cur
+        session_start(u.id, chat_id, "task_reward", data)
         try:
             await q.edit_message_reply_markup(reply_markup=reward_keypad_kb(cur))
         except TelegramError as e:
@@ -959,13 +1029,9 @@ async def keypad_router(update, ctx):
         val = int(cur)
         if val < 1 or val > TASK_REWARD_CAP:
             await q.answer(f"Must be 1–{TASK_REWARD_CAP}.", show_alert=True); return
-        if "channel" not in flow["data"]:
-            await q.answer("Session expired — start over.", show_alert=True)
-            ADMIN_FLOW.pop(u.id, None)
-            return
-        flow["data"]["reward"] = val
-        flow["step"] = "title"
-        ch = flow["data"]["channel"]
+        data["reward"] = val
+        session_start(u.id, chat_id, "task_title", data)
+        ch = data.get("channel", "?")
         try:
             await q.edit_message_text(
                 f"✅ Channel: `{ch}`\n"
